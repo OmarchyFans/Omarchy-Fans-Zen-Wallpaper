@@ -3,6 +3,10 @@
 The bar popup reads the newest sections of this file to tell you what changed
 when an update is available. Keep one short line per bullet.
 
+## 0.4.1
+
+- Shortened the manifest description to fit the marketplace's 500-character limit
+
 ## 0.4.0
 
 - Renamed to Zen Wallpaper (repository Omarchy-Fans-Zen-Wallpaper, plugin id fans.omarchy.zen-wallpaper, command omarchy-zen)
