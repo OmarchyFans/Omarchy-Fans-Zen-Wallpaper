@@ -3,6 +3,10 @@
 The bar popup reads the newest sections of this file to tell you what changed
 when an update is available. Keep one short line per bullet.
 
+## 0.4.2
+
+- Every yt-dlp and ffmpeg call now has a total deadline (default 25s/20s, killed with SIGKILL after a 5s grace) and yt-dlp's captured output is capped at 4MB, matching the existing curl bounds. A stalled or oversized remote response can no longer hold the wallpaper service indefinitely or grow a shell variable without bound.
+
 ## 0.4.1
 
 - Shortened the manifest description to fit the marketplace's 500-character limit

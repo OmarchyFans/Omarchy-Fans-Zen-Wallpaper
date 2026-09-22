@@ -81,6 +81,23 @@ KEEP_FRAMES=12
 die() { echo "omarchy-zen: $*" >&2; exit 1; }
 now() { date +%s; }
 
+# HANCORE-linux's marketplace review (#7099 follow-up): every automatically
+# invoked yt-dlp/ffmpeg call talks to remote YouTube data with no total
+# deadline and no output ceiling, unlike the curl paths above (which already
+# have --max-time/--max-filesize). A stalled or oversized remote response
+# could hold the long-lived wallpaper service/helper indefinitely or exhaust
+# its memory. `timeout -k` gives a real SIGKILL grace after SIGTERM so a
+# yt-dlp/ffmpeg child that ignores the first signal is still reaped; each
+# yt-dlp call site below also pipes through `head -c` so a runaway response
+# can't grow a captured shell variable without bound.
+YTDLP_TIMEOUT_SEC="${OMARCHY_ZEN_YTDLP_TIMEOUT:-25}"
+YTDLP_MAX_BYTES="${OMARCHY_ZEN_YTDLP_MAX_BYTES:-4000000}"
+FFMPEG_TIMEOUT_SEC="${OMARCHY_ZEN_FFMPEG_TIMEOUT:-20}"
+
+# ffmpeg_bounded <ffmpeg args...> -> same exit status as ffmpeg, killed at
+# FFMPEG_TIMEOUT_SEC (frame capture writes a file directly, no output to cap).
+ffmpeg_bounded() { timeout -k 5 "$FFMPEG_TIMEOUT_SEC" ffmpeg "$@"; }
+
 # ---- config ------------------------------------------------------------------
 defaults() {
   jq -n --arg url "$DEFAULT_URL" '{
@@ -143,7 +160,7 @@ newest_video_id() { # newest_video_id URL KIND
       cands=("$url/streams" "$url/videos") ;;
   esac
   for cand in "${cands[@]}"; do
-    id=$(yt-dlp --no-warnings --flat-playlist --playlist-items 1 --print id -- "$cand" 2>/dev/null | head -n1 || true)
+    id=$(timeout -k 5 "$YTDLP_TIMEOUT_SEC" yt-dlp --no-warnings --flat-playlist --playlist-items 1 --print id -- "$cand" 2>/dev/null | head -c 200 | head -n1 || true)
     if [[ $id =~ ^[A-Za-z0-9_-]{6,}$ ]]; then echo "$id"; return 0; fi
   done
   return 1
@@ -223,7 +240,7 @@ cmd_resolve() {
     id=$(newest_video_id "$url" "$kind") || die "no video found at $url"
     watch="https://www.youtube.com/watch?v=$id"
   fi
-  info=$(yt-dlp --no-warnings --no-playlist -j -- "$watch" 2>&1) || die "yt-dlp: ${info##*$'\n'}"
+  info=$(timeout -k 5 "$YTDLP_TIMEOUT_SEC" yt-dlp --no-warnings --no-playlist -j -- "$watch" 2>&1 | head -c "$YTDLP_MAX_BYTES") || die "yt-dlp: ${info##*$'\n'}"
   out=$(jq -c --arg src "$url" --arg kind "$kind" --argjson q "$quality" --argjson now "$(now)" "$FORMAT_JQ" <<<"$info") || die "could not read the yt-dlp answer"
   [[ $(jq -r .video_url <<<"$out") != "" ]] || die "no playable video format at $watch"
   out=$(jq -c --argjson exp "$(url_expiry "$(jq -r .video_url <<<"$out")")" '.expires = $exp' <<<"$out")
@@ -270,7 +287,7 @@ cmd_still() {
   out="$FRAMES/${id}-$(date +%Y%m%d-%H%M%S)${at:+-at$at}.png"
   local -a seek=(); [[ -n $at ]] && seek=(-ss "$at")
   # -- is not an ffmpeg thing; the URL starts with https:// and the output with /.
-  ffmpeg -v error -y -nostdin "${seek[@]}" -i "$video_url" -frames:v 1 -q:v 2 "$out" </dev/null \
+  ffmpeg_bounded -v error -y -nostdin "${seek[@]}" -i "$video_url" -frames:v 1 -q:v 2 "$out" </dev/null \
     || die "ffmpeg could not grab a frame (the stream URL may have expired: try 'omarchy-zen resolve --force')"
   [[ -s $out ]] || die "ffmpeg wrote no frame"
   prune_frames
@@ -528,7 +545,7 @@ cmd_bookmark() {
         extra=$(jq -c '{views: (.views // 0), viewers: (.viewers // 0), live: (.live // false), channel_url: (.channel_url // "")}' <<<"$entry")
       else
         url="https://www.youtube.com/watch?v=$id"
-        IFS=$'\t' read -r title channel < <(yt-dlp --no-warnings --skip-download --no-playlist --print '%(title)s\t%(channel)s' -- "$url" 2>/dev/null | head -n1 || true)
+        IFS=$'\t' read -r title channel < <(timeout -k 5 "$YTDLP_TIMEOUT_SEC" yt-dlp --no-warnings --skip-download --no-playlist --print '%(title)s\t%(channel)s' -- "$url" 2>/dev/null | head -c "$YTDLP_MAX_BYTES" | head -n1 || true)
         [[ -n $title ]] || title=$id
       fi
       [[ -n $url && $url != null ]] || url="https://www.youtube.com/watch?v=$id"
@@ -602,8 +619,9 @@ channel_videos() { # channel_videos ID [refresh] -> JSON array of entries (strea
   f="$CHANNEL_CACHE/$id.json"
   if (( refresh )) || ! fresh "$f" "$CHANNEL_TTL"; then
     mkdir -p "$CHANNEL_CACHE"; tmp=$(mktemp "$CHANNEL_CACHE/.$id.XXXXXX")
-    { yt-dlp --no-warnings --flat-playlist --playlist-items 1-10 -j -- "${url%/}/streams" 2>/dev/null || true
-      yt-dlp --no-warnings --flat-playlist --playlist-items 1-10 -j -- "${url%/}/videos" 2>/dev/null || true; } \
+    { timeout -k 5 "$YTDLP_TIMEOUT_SEC" yt-dlp --no-warnings --flat-playlist --playlist-items 1-10 -j -- "${url%/}/streams" 2>/dev/null || true
+      timeout -k 5 "$YTDLP_TIMEOUT_SEC" yt-dlp --no-warnings --flat-playlist --playlist-items 1-10 -j -- "${url%/}/videos" 2>/dev/null || true; } \
+      | head -c "$YTDLP_MAX_BYTES" \
       | jq -sc --arg curl "$url" '[.[] | select(.id != null and .live_status != "is_upcoming")] | unique_by(.id) | .[0:20]
           | map({id, title: (.title // ""), channel: (.channel // .uploader // ""), channel_url: (.channel_url // .uploader_url // $curl),
                  url: ("https://www.youtube.com/watch?v=" + .id), live: (.live_status == "is_live"),
@@ -620,7 +638,7 @@ cmd_channel() {
     add)
       url=${1:-}; valid_url "$url" || die "only https YouTube channel links are accepted"
       id=$(channel_id_of "$url") || die "not a channel URL: $url"
-      name=$(yt-dlp --no-warnings --flat-playlist --playlist-items 1 --print channel -- "${url%/}/videos" 2>/dev/null | head -n1 || true)
+      name=$(timeout -k 5 "$YTDLP_TIMEOUT_SEC" yt-dlp --no-warnings --flat-playlist --playlist-items 1 --print channel -- "${url%/}/videos" 2>/dev/null | head -c "$YTDLP_MAX_BYTES" | head -n1 || true)
       [[ -n $name ]] || name=$id
       mkdir -p "$CONFIG_DIR"
       my_channels_json | jq --arg id "$id" --arg n "$name" --arg u "${url%/}" --argjson at "$(now)" \
