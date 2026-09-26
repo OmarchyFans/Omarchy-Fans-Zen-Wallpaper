@@ -1,17 +1,55 @@
 #!/bin/bash
-# test stub: answers from $DZ_FIXTURE (a yt-dlp -j document); records argv in $DZ_LOG
+# test stub: answers from $DZ_FIXTURE (a yt-dlp -j document); records argv in $DZ_LOG.
+# Two creators: Aether Journey and Lofi Girl, reachable by @handle or channel id.
 echo "yt-dlp $*" >>"${DZ_LOG:-/dev/null}"
 args=("$@")
 url=${args[-1]}
+who() { # who URL -> aether | lofi | none
+  case "$1" in
+    *AetherJourneyMusic*|*UC5q5r9IvGXREGJw0VPp65uQ*|*vFJuk4U-V7Q*) echo aether ;;
+    *LofiGirl*|*UCSJ4gkVC6NrvII8umztf0Ow*|*LOFI*|*rFZHOHl-L8A*) echo lofi ;;
+    *) echo none ;;
+  esac
+}
+meta() { # meta aether|lofi -> id handle name followers
+  case "$1" in
+    aether) echo "UC5q5r9IvGXREGJw0VPp65uQ @AetherJourneyMusic Aether_Journey 28500" ;;
+    lofi) echo "UCSJ4gkVC6NrvII8umztf0Ow @LofiGirl Lofi_Girl 15800000" ;;
+  esac
+}
+entry() { # entry ID TITLE IDX CHANNEL CID [extra json]
+  printf '{"id":"%s","title":"%s","playlist_index":%s,"playlist_channel":"%s","playlist_channel_id":"%s"%s}\n' "$1" "$2" "$3" "$4" "$5" "${6:-}"
+}
 if [[ " $* " == *" --flat-playlist "* ]]; then
+  c=$(who "$url")
+  if [[ " $* " == *" -J "* ]]; then
+    [[ $c == none ]] && exit 1
+    read -r cid h n f <<<"$(meta "$c")"
+    printf '{"channel_id":"%s","uploader_id":"%s","channel":"%s","channel_follower_count":%s,"entries":[]}\n' "$cid" "$h" "${n//_/ }" "$f"
+    exit 0
+  fi
   if [[ " $* " == *" -j "* ]]; then
-    case "$url" in
-      */streams) printf '%s\n' '{"id":"LIVEaaaaaaa","title":"Zen live","channel":"Aether Journey","channel_url":"https://www.youtube.com/@AetherJourneyMusic","live_status":"is_live","concurrent_view_count":42}' ;;
-      */videos) printf '%s\n' '{"id":"VIDbbbbbbbb","title":"Zen video one","channel":"Aether Journey","channel_url":"https://www.youtube.com/@AetherJourneyMusic","duration":7200,"view_count":1000}' '{"id":"VIDccccccc1","title":"Upcoming","live_status":"is_upcoming"}' ;;
+    case "$c:$url" in
+      aether:*/streams)
+        entry LIVEaaaaaaa "Zen live" 1 "Aether Journey" UC5q5r9IvGXREGJw0VPp65uQ ',"live_status":"is_live","concurrent_view_count":42'
+        entry PASTstream1 "Past zen stream" 2 "Aether Journey" UC5q5r9IvGXREGJw0VPp65uQ ',"live_status":"was_live","duration":10800,"view_count":500'
+        entry UPCOMINGxx1 "Upcoming" 3 "Aether Journey" UC5q5r9IvGXREGJw0VPp65uQ ',"live_status":"is_upcoming"' ;;
+      aether:*/videos)
+        entry VIDbbbbbbbb "Zen video one" 1 "Aether Journey" UC5q5r9IvGXREGJw0VPp65uQ ',"duration":7200,"view_count":1000'
+        entry VIDshort001 "A short" 2 "Aether Journey" UC5q5r9IvGXREGJw0VPp65uQ ',"duration":45,"view_count":99999'
+        entry VIDlong0001 "Zen long bear walk" 3 "Aether Journey" UC5q5r9IvGXREGJw0VPp65uQ ',"duration":21600,"view_count":300' ;;
+      lofi:*/streams)
+        entry LOFI1111111 "lofi radio" 1 "Lofi Girl" UCSJ4gkVC6NrvII8umztf0Ow ',"live_status":"is_live","concurrent_view_count":20000' ;;
+      lofi:*/videos)
+        if [[ -n ${DZ_BIG_CATALOG:-} ]]; then
+          long=$(printf 'lofi %.0s' $(seq 1 70))
+          for i in $(seq 1 "$DZ_BIG_CATALOG"); do entry "$(printf 'BIG%08d' "$i")" "$long $i" "$i" "Lofi Girl" UCSJ4gkVC6NrvII8umztf0Ow ',"duration":3600,"view_count":1'; done
+        else
+          entry LOFIvid0001 "lofi mix" 1 "Lofi Girl" UCSJ4gkVC6NrvII8umztf0Ow ',"duration":3600,"view_count":900000'
+        fi ;;
     esac
     exit 0
   fi
-  if [[ " $* " == *" --print channel "* ]]; then echo "Stub Creator"; exit 0; fi
   case "$url" in
     *"/streams") [[ -n ${DZ_STREAMS_EMPTY:-} ]] && exit 1; echo "STREAM01xyz" ;;
     *"/videos") echo "VIDEO01abcd" ;;
@@ -20,6 +58,15 @@ if [[ " $* " == *" --flat-playlist "* ]]; then
   esac
   exit 0
 fi
-if [[ " $* " == *" --print "* ]]; then printf 'Fetched title\tFetched channel\n'; exit 0; fi
+if [[ " $* " == *" --print "* ]]; then
+  if [[ " $* " == *"%(channel_id)s"* ]]; then
+    c=$(who "$url"); [[ $c == none ]] && c=aether
+    read -r cid h n f <<<"$(meta "$c")"
+    printf '%s\t%s\t%s\t%s\n' "$cid" "$h" "${n//_/ }" "$f"
+  else
+    printf 'Fetched title\tFetched channel\n'
+  fi
+  exit 0
+fi
 if [[ -n ${DZ_FAIL:-} ]] && [[ -z ${DZ_FAIL_MATCH:-} || $url == *"$DZ_FAIL_MATCH"* ]]; then echo "ERROR: [youtube] boom" >&2; exit 1; fi
 cat "${DZ_FIXTURE:?}"

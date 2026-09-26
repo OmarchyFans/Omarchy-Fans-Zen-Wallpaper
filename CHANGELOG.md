@@ -3,6 +3,13 @@
 The bar popup reads the newest sections of this file to tell you what changed
 when an update is available. Keep one short line per bullet.
 
+## 0.5.0
+
+- Save any YouTube channel from its link, @handle or one of its videos, or with the creator button on any row
+- Browse a creator's whole catalog: live now, past streams and uploads, sorted and filtered, 30 rows at a time
+- Bookmark creators: bookmarked ones lead the Library selector and appear under Bookmarks
+- The same creator added by handle, channel link or video is kept once
+
 ## 0.4.2
 
 - Every yt-dlp and ffmpeg call now has a total deadline (default 25s/20s, killed with SIGKILL after a 5s grace) and yt-dlp's captured output is capped at 4MB, matching the existing curl bounds. A stalled or oversized remote response can no longer hold the wallpaper service indefinitely or grow a shell variable without bound.

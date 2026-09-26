@@ -30,6 +30,13 @@ Panel {
   property var lib: null
   property string browse: "cat:zen"        // bookmarks | cat:<id> | ch:<id>
   property string followDraft: ""
+  // creator view: which videos, in what order, how many rows
+  property string chKind: "all"          // all | live | stream | upload
+  property string chSort: "newest"       // newest | popular | longest
+  property string chFilter: ""
+  property int chLimit: 30
+  property string channelNote: ""
+  onBrowseChanged: { chKind = "all"; chSort = "newest"; chFilter = ""; chLimit = 30; channelNote = "" }
   property bool loading: false
   property string error: ""
   property string urlDraft: ""
@@ -43,25 +50,32 @@ Panel {
   readonly property real volume: typeof cfg.volume === "number" ? cfg.volume : 0.35
   readonly property bool engineUp: engine !== null
   readonly property var browseOptions: {
-    var opts = [{ value: "bookmarks", label: "Bookmarks" + (lib && lib.bookmarks ? " (" + lib.bookmarks.length + ")" : "") }]
+    var nStreams = lib && lib.bookmarks ? lib.bookmarks.length : 0
+    var nCreators = lib && lib.saved_creators ? lib.saved_creators.length : 0
+    var opts = [{ value: "bookmarks", label: "Bookmarks" + (lib ? " (" + nStreams + " stream" + (nStreams === 1 ? "" : "s")
+                  + (nCreators ? " · " + nCreators + " creator" + (nCreators === 1 ? "" : "s") : "") + ")" : "") }]
     var cats = lib && lib.categories ? lib.categories : [{ id: "zen", name: "Zen" }]
     for (var i = 0; i < cats.length; i++)
       opts.push({ value: "cat:" + cats[i].id, label: cats[i].name + (cats[i].bookmarked ? "  ·  " + cats[i].bookmarked + " bookmarked" : "") })
     var chans = lib && lib.channels ? lib.channels : [{ id: "AetherJourneyMusic", name: "Aether Journey" }]
-    for (var k = 0; k < chans.length; k++)
-      opts.push({ value: "ch:" + chans[k].id, label: "Creator: " + chans[k].name + (chans[k].bookmarked ? "  ·  " + chans[k].bookmarked + " bookmarked" : "") })
+    var seen = false
+    for (var k = 0; k < chans.length; k++) {
+      if ("ch:" + chans[k].id === browse) seen = true
+      opts.push({ value: "ch:" + chans[k].id, label: (chans[k].bookmarked ? "★ " : "") + "Creator: " + chans[k].name
+                  + (chans[k].bookmarked_streams ? "  ·  " + chans[k].bookmarked_streams + " bookmarked" : "") })
+    }
+    // A creator you are looking at without having bookmarked it.
+    if (!seen && browse.indexOf("ch:") === 0)
+      opts.push({ value: browse, label: "Creator: " + (creator ? creator.name : browse.substring(3)) + " (not bookmarked)" })
     return opts
   }
-  readonly property var browseChannel: {
-    if (!lib || browse.indexOf("ch:") !== 0) return null
-    var id = browse.substring(3)
-    for (var i = 0; i < (lib.channels || []).length; i++) if (lib.channels[i].id === id) return lib.channels[i]
-    return null
-  }
+  readonly property var creator: lib && lib.kind === "channel" && lib.creator ? lib.creator : null
+  readonly property bool libLoading: libProc.running
   readonly property var libRows: {
     if (!lib) return []
     var rows = lib.entries || []
-    if (lib.now && lib.now.id && !rows.some(function(e) { return e.id === lib.now.id })) rows = [Object.assign({}, lib.now, { isNow: true })].concat(rows)
+    if (lib.kind !== "channel" && lib.now && lib.now.id && !rows.some(function(e) { return e.id === lib.now.id }))
+      rows = [Object.assign({}, lib.now, { isNow: true })].concat(rows)
     return rows
   }
   readonly property string engineState: engine ? String(engine.state || "") : ""
@@ -157,7 +171,9 @@ Panel {
     if (libProc.running) { libAgain.restart(); return }
     var argv = [root.cli, "library", "--json"]
     if (root.browse === "bookmarks") argv.push("--bookmarks")
-    else if (root.browse.indexOf("ch:") === 0) argv.push("--channel", root.browse.substring(3))
+    else if (root.browse.indexOf("ch:") === 0)
+      argv.push("--channel", root.browse.substring(3), "--kind", root.chKind, "--sort", root.chSort,
+                "--filter", root.chFilter, "--limit", String(root.chLimit))
     else argv.push("--category", root.browse.substring(4))
     if (refresh) argv.push("--refresh")
     libProc.command = argv
@@ -173,11 +189,50 @@ Panel {
       try { root.lib = JSON.parse(libOut.text) } catch (e) { root.error = "bad JSON from library" }
     }
   }
+  // Bookmark (save) a creator, or remove the bookmark. With browseAfter the
+  // popup switches to that creator's catalog once the helper answers.
+  Process {
+    id: chanProc
+    property bool browseAfter: false
+    stdout: StdioCollector { id: chanOut; waitForEnd: true }
+    stderr: StdioCollector { id: chanErr; waitForEnd: true }
+    onExited: function(code) {
+      root.channelNote = ""
+      if (code !== 0) { root.channelNote = (String(chanErr.text || "").trim().replace(/^omarchy-zen: /, "") || ("channel exited " + code)); return }
+      var rec = null
+      try { rec = JSON.parse(chanOut.text) } catch (e) { rec = null }
+      if (rec && chanProc.browseAfter) { root.browse = "ch:" + rec.id }
+      root.error = ""
+      root.loadLibrary(false)
+    }
+  }
+  function channelCmd(argv, browseAfter, note) {
+    if (chanProc.running) return
+    chanProc.browseAfter = browseAfter
+    root.channelNote = note || "Saving…"
+    chanProc.command = [root.cli, "channel"].concat(argv).concat(["--json"])
+    chanProc.running = true
+  }
   function follow() {
     var u = String(followDraft || "").trim()
     if (!u) return
     root.followDraft = ""
-    act(["channel", "add", u])
+    channelCmd(["add", u], true, "Looking the creator up on YouTube…")
+  }
+  // A row's creator: open their catalog (bookmarked or not).
+  function browseCreator(row) {
+    var ref = row.creator ? row.creator.id : String(row.creator_ref || "")
+    if (!ref) return
+    root.browse = "ch:" + ref
+    root.loadLibrary(false)
+  }
+  function reloadCreator() { root.chLimit = 30; root.loadLibrary(false) }
+  Timer { id: filterTimer; interval: 400; onTriggered: root.reloadCreator() }
+  function fmtDuration(sec) {
+    sec = Number(sec || 0)
+    if (sec <= 0) return ""
+    var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60)
+    return h > 0 ? h + " h" + (m ? " " + m + " min" : "") : m + " min"
   }
 
   function act(argv) {
@@ -500,25 +555,141 @@ Panel {
             width: parent.width; wrapMode: Text.WordWrap; textFormat: Text.PlainText
             color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption
             text: !root.lib ? "Loading the library…"
-              : (root.browse === "bookmarks" ? "Your bookmarks. Bookmark anything with the flag on its row."
-                : (root.browseChannel ? "Latest from " + root.browseChannel.name + " (live streams first). Play the creator to follow their newest upload every day."
+              : (root.browse === "bookmarks" ? "Your bookmarked creators and streams. Bookmark a stream with the flag on its row, a creator with the flag in their catalog."
+                : (root.browse.indexOf("ch:") === 0 ? (root.libLoading && !root.creator ? "Fetching the catalog from YouTube…" : "Everything this creator has on YouTube: live now, past streams and uploads.")
                   : "The ten most popular long streams in this category, from YouTube searches (catalog " + (root.lib.generated || "") + ")."))
               + (root.lib && root.lib.ratings_api_available ? " Stars and plays are shared with every install." : " Community stars and play counts are not available yet; your stars stay on this machine until then.")
           }
-          Flow {
+          // ---- a creator's catalog ----
+          Column {
             width: parent.width
             spacing: Style.space(6)
-            visible: root.browseChannel !== null
-            Button {
-              text: "Play this creator"; iconText: "󰐊"; foreground: Color.accent; fontFamily: root.fontFamily
-              tooltipText: "Follow: their newest stream or upload becomes the wallpaper, rechecked every day"
-              onClicked: if (root.browseChannel) root.act(["play", root.browseChannel.id])
+            visible: root.creator !== null
+            Text {
+              width: parent.width; elide: Text.ElideRight; textFormat: Text.PlainText
+              color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.body; font.bold: true
+              text: root.creator ? root.creator.name + (root.creator.followers > 0 ? "  ·  " + root.fmtCount(root.creator.followers) + " subscribers" : "") : ""
             }
-            Button {
-              visible: !!(root.browseChannel && root.browseChannel.added)
-              text: "Unfollow"; foreground: root.dim; fontFamily: root.fontFamily
-              onClicked: { var id = root.browseChannel.id; root.browse = "cat:zen"; root.act(["channel", "remove", id]) }
+            Text {
+              width: parent.width; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+              color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption
+              text: root.creator && root.creator.counts
+                ? root.creator.counts.all + " on YouTube: " + root.creator.counts.live + " live now, " + root.creator.counts.stream + " past streams, "
+                  + root.creator.counts.upload + " uploads" + (root.chFilter ? " matching \u201c" + root.chFilter + "\u201d" : "")
+                : ""
             }
+            Text {
+              width: parent.width; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+              visible: root.channelNote !== ""
+              color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption
+              text: root.channelNote
+            }
+            Flow {
+              width: parent.width
+              spacing: Style.space(6)
+              Button {
+                text: root.creator && root.creator.bookmarked ? "Bookmarked" : "Bookmark this creator"
+                iconText: root.creator && root.creator.bookmarked ? "󰃀" : "󰃃"
+                foreground: root.creator && root.creator.bookmarked ? Color.accent : root.foreground; fontFamily: root.fontFamily
+                tooltipText: root.creator && root.creator.bookmarked ? "Remove the bookmark" + (root.creator.builtin ? " (a built-in creator stays in the selector)" : "")
+                  : "Keep this creator in the Library selector and under Bookmarks"
+                onClicked: if (root.creator) root.channelCmd(["toggle", root.creator.channel_id || root.creator.id], true)
+              }
+              Button {
+                text: "Play newest"; iconText: "󰐊"; foreground: Color.accent; fontFamily: root.fontFamily
+                tooltipText: "Their newest stream or upload becomes the wallpaper, rechecked every day"
+                onClicked: if (root.creator) root.act(["play", root.creator.url])
+              }
+              Button {
+                text: "Open on YouTube"; iconText: "󰗃"; foreground: root.dim; fontFamily: root.fontFamily
+                onClicked: if (root.creator) { root.close(); Util.execArgv([root.cli, "channel", "open", root.creator.url]) }
+              }
+            }
+            Flow {
+              width: parent.width
+              spacing: Style.space(4)
+              Repeater {
+                model: [{ k: "all", n: "All" }, { k: "live", n: "Live now" }, { k: "stream", n: "Past streams" }, { k: "upload", n: "Uploads" }]
+                delegate: Button {
+                  required property var modelData
+                  visible: !root.creator || !root.creator.counts || modelData.k === "all" || root.creator.counts[modelData.k] > 0
+                  text: modelData.n + (root.creator && root.creator.counts ? " (" + root.creator.counts[modelData.k] + ")" : "")
+                  selected: root.chKind === modelData.k
+                  foreground: root.chKind === modelData.k ? Color.accent : root.foreground; fontFamily: root.fontFamily
+                  onClicked: if (root.chKind !== modelData.k) { root.chKind = modelData.k; root.reloadCreator() }
+                }
+              }
+            }
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+              Dropdown {
+                id: sortDropdown
+                width: Style.space(150)
+                anchors.verticalCenter: parent.verticalCenter
+                showLabel: false
+                options: [{ value: "newest", label: "Newest first" }, { value: "popular", label: "Most viewed" }, { value: "longest", label: "Longest" }]
+                fontFamily: root.fontFamily
+                Connections {
+                  target: root
+                  function onChSortChanged() { if (sortDropdown.value !== root.chSort) sortDropdown.value = root.chSort }
+                }
+                Component.onCompleted: value = root.chSort
+                onChanged: function(v) { if (v !== root.chSort) { root.chSort = v; root.reloadCreator() } }
+              }
+              TextField {
+                id: filterField
+                width: parent.width - sortDropdown.width - parent.spacing
+                foreground: root.foreground
+                placeholderText: "Filter this catalog by title"
+                font.family: root.fontFamily
+                Connections {
+                  target: root
+                  function onChFilterChanged() { if (filterField.text !== root.chFilter) filterField.text = root.chFilter }
+                }
+                onTextEdited: { root.chFilter = text; filterTimer.restart() }
+                onAccepted: { filterTimer.stop(); root.reloadCreator() }
+              }
+            }
+          }
+
+          // ---- bookmarked creators (Bookmarks view) ----
+          Column {
+            width: parent.width
+            spacing: Style.space(4)
+            visible: root.browse === "bookmarks" && !!root.lib && (root.lib.saved_creators || []).length > 0
+            PanelSectionHeader { width: parent.width; text: "Bookmarked creators" }
+            Repeater {
+              model: root.browse === "bookmarks" && root.lib ? (root.lib.saved_creators || []) : []
+              delegate: Row {
+                id: crow
+                required property var modelData
+                width: column.width
+                spacing: Style.space(6)
+                Text {
+                  width: parent.width - browseBtn.width - unbmBtn.width - parent.spacing * 2
+                  anchors.verticalCenter: parent.verticalCenter
+                  elide: Text.ElideRight; textFormat: Text.PlainText
+                  color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.body
+                  text: crow.modelData.name + (crow.modelData.followers > 0 ? "  ·  " + root.fmtCount(crow.modelData.followers) + " subscribers" : "")
+                }
+                Button {
+                  id: browseBtn
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "Browse"; iconText: "󰀄"; foreground: Color.accent; fontFamily: root.fontFamily
+                  tooltipText: "Everything " + crow.modelData.name + " has on YouTube"
+                  onClicked: { root.browse = "ch:" + crow.modelData.id; root.loadLibrary(false) }
+                }
+                Button {
+                  id: unbmBtn
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: ""; iconText: "󰃀"; foreground: Color.accent; fontFamily: root.fontFamily
+                  tooltipText: "Remove the bookmark"
+                  onClicked: root.channelCmd(["remove", crow.modelData.channel_id || crow.modelData.id], false)
+                }
+              }
+            }
+            PanelSectionHeader { width: parent.width; text: "Bookmarked streams" }
           }
           Repeater {
             model: root.libRows
@@ -548,11 +719,12 @@ Panel {
                 width: parent.width
                 spacing: Style.space(8)
                 Text {
-                  width: parent.width - starRow.width - bmBtn.width - parent.spacing * 2
+                  width: parent.width - starRow.width - bmBtn.width - (creatorBtn.visible ? creatorBtn.width + parent.spacing : 0) - parent.spacing * 2
                   anchors.verticalCenter: parent.verticalCenter
                   elide: Text.ElideRight; textFormat: Text.PlainText
                   color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption
-                  text: (erow.modelData.channel || "") + (erow.modelData.live ? " · live" : "")
+                  text: (root.lib && root.lib.kind === "channel" ? "" : (erow.modelData.channel || "")) + (erow.modelData.live ? " · live" : "")
+                    + (!erow.modelData.live && erow.modelData.duration > 0 && root.lib && root.lib.kind === "channel" ? " · " + root.fmtDuration(erow.modelData.duration) : "")
                     + (erow.modelData.live && erow.modelData.viewers > 0 ? " · ~" + root.fmtCount(erow.modelData.viewers) + " watching" : "")
                     + (!erow.modelData.live && erow.modelData.views > 0 ? " · " + root.fmtCount(erow.modelData.views) + " YouTube views" : "")
                     + (root.lib && root.lib.ratings_api_available ? " · " + root.fmtCount(erow.modelData.plays || 0) + " Zen play" + (erow.modelData.plays === 1 ? "" : "s") : "")
@@ -579,6 +751,16 @@ Panel {
                   }
                 }
                 Button {
+                  id: creatorBtn
+                  anchors.verticalCenter: parent.verticalCenter
+                  visible: !!root.lib && root.lib.kind !== "channel" && !!(erow.modelData.creator || erow.modelData.creator_ref)
+                  text: ""; iconText: "󰀄"; fontFamily: root.fontFamily
+                  foreground: erow.modelData.creator && erow.modelData.creator.bookmarked ? Color.accent : root.dim
+                  tooltipText: "Browse everything " + (erow.modelData.channel || "this creator") + " has on YouTube"
+                    + (erow.modelData.creator && erow.modelData.creator.bookmarked ? " (bookmarked creator)" : "")
+                  onClicked: root.browseCreator(erow.modelData)
+                }
+                Button {
                   id: bmBtn
                   anchors.verticalCenter: parent.verticalCenter
                   text: ""; iconText: erow.modelData.bookmarked ? "󰃀" : "󰃃"; fontFamily: root.fontFamily
@@ -594,7 +776,20 @@ Panel {
             width: parent.width; wrapMode: Text.WordWrap; textFormat: Text.PlainText
             visible: root.lib !== null && root.libRows.length === 0
             color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption
-            text: root.browse === "bookmarks" ? "No bookmarks yet." : "Nothing here yet."
+            text: root.browse === "bookmarks" ? "No bookmarked streams yet."
+              : (root.creator ? (root.chFilter ? "Nothing in this catalog matches." : "Nothing here yet.") : "Nothing here yet.")
+          }
+          Button {
+            visible: root.creator !== null && root.libRows.length < (root.creator ? root.creator.total : 0)
+            text: root.libLoading ? "Loading…" : "Show 30 more  (" + root.libRows.length + " of " + (root.creator ? root.creator.total : 0) + ")"
+            foreground: Color.accent; fontFamily: root.fontFamily
+            onClicked: if (!root.libLoading) { root.chLimit += 30; root.loadLibrary(false) }
+          }
+          Text {
+            width: parent.width; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+            visible: root.channelNote !== ""
+            color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption
+            text: root.channelNote
           }
           Row {
             width: parent.width
@@ -603,7 +798,7 @@ Panel {
               id: followField
               width: parent.width - followButton.width - parent.spacing
               foreground: root.foreground
-              placeholderText: "Follow a creator: https://www.youtube.com/@channel"
+              placeholderText: "Bookmark a creator: channel link, @handle, or any of their videos"
               font.family: root.fontFamily
               text: root.followDraft
               onTextEdited: root.followDraft = text
@@ -612,8 +807,8 @@ Panel {
             Button {
               id: followButton
               anchors.verticalCenter: parent.verticalCenter
-              text: "Follow"; foreground: Color.accent; fontFamily: root.fontFamily
-              tooltipText: "Add this creator to the Library selector"
+              text: "Save"; foreground: Color.accent; fontFamily: root.fontFamily
+              tooltipText: "Bookmark this creator and browse their catalog"
               onClicked: root.follow()
             }
           }

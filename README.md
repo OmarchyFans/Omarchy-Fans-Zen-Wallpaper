@@ -6,9 +6,9 @@ Another [Omarchy.Fans](https://omarchy.fans) product, written by ModPunk.
   stream (lofi, zen, ambient, jazz, rain, a 24/7 radio) and it plays on the
   layer under your windows, picture and sound, straight from YouTube.
 - **Many streams to choose from.** A curated library of the ten most popular
-  streams in each of eleven categories, any creator you follow (their newest
-  upload, checked daily), or any YouTube link you paste. Bookmark the ones you
-  like, rate them, and see what every other install plays and rates.
+  streams in each of eleven categories, the whole catalog of any YouTube
+  creator you save, or any YouTube link you paste. Bookmark the streams and
+  creators you like, rate them, and see what every other install plays and rates.
 - **Or a still.** Prefer a picture? One frame from the stream becomes your
   Omarchy background, and a fresh one every day; the music can keep playing.
 - **Themes from the scene.** One click asks Aether, Omarchy's theme generator,
@@ -44,9 +44,13 @@ by Aether Journey, and that creator is the first entry in the Library selector.
   24/7 streams. Built from YouTube searches by `tools/build-catalog.sh` and
   refreshed from this repository's main branch once a day, so the list stays
   current without a plugin update. Aether Journey's bear path stays first in Zen.
-- **Creators.** Follow YouTube channels (Aether Journey is in from the start):
-  the selector lists a creator's latest streams and uploads, and *Play this
-  creator* makes their newest upload the wallpaper, rechecked every day.
+- **Creators.** Save any YouTube channel by pasting its link, its @handle or
+  a link to any of its videos, or with the creator button on any row. Its whole
+  catalog opens in the popup: live now, past streams and uploads (up to 300 of
+  each), sorted newest, most viewed or longest, filtered by title, 30 rows at a
+  time. Saving a creator bookmarks it: it moves to the top of the Library
+  selector and shows under Bookmarks. *Play newest* makes its newest stream or
+  upload the wallpaper, rechecked every day. Aether Journey is built in.
 - **Bookmarks, ratings and play counts.** Flag any entry, give it one to five
   stars. Stars and plays (one per install and day) are shared with every
   install through a small API, so each row shows everyone's average, how many
@@ -135,7 +139,9 @@ omarchy-zen play ID|URL|CREATOR      play a library entry, any YouTube video, or
 omarchy-zen bookmark [list|add [ID]|remove ID|toggle [ID]]
 omarchy-zen rate ID 1..5             0 removes; shared unless share-ratings off
 omarchy-zen ratings [--refresh]      everyone's averages
-omarchy-zen channel [list|add URL|remove ID|videos ID]
+omarchy-zen channel add|toggle|remove [REF]   bookmark a creator: link, @handle, channel id or one of its videos
+omarchy-zen channel videos REF [--kind all|live|stream|upload] [--sort newest|popular|longest] [--filter TEXT]
+omarchy-zen channel list | open [REF]
 omarchy-zen catalog [--refresh]      the curated list
 omarchy-zen position                 where the stream is (saved every 30 s)
 ```

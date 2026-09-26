@@ -182,7 +182,7 @@ if want library; then
   out=$("$B" library --json --bookmarks); [[ $(j .kind "$out") == bookmarks && $(j '.entries|length' "$out") == 3 && $(j '.entries[0].playing' "$out") == true && $(j '.now.id' "$out") == vFJuk4U-V7Q ]] && tok || tfail "library --bookmarks + now: $(j '{kind, n: (.entries|length), now: .now.id}' "$out")"
   lofi=$(j '.entries[] | select(.id == "LOFI1111111")' "$out")
   [[ $(j .views "$lofi") == 0 && $(j .viewers "$lofi") == 20000 && $(j .live "$lofi") == true && $(j '.entries[0].views' "$out") == 500000 ]] && tok || tfail "bookmarks keep views/viewers/live from the catalog: $lofi"
-  [[ $(j '.categories[0].bookmarked' "$out") == 1 && $(j '.categories[1].bookmarked' "$out") == 1 && $(j '.channels[0].bookmarked' "$out") == 1 ]] && tok || tfail "bookmark counts per category and creator: $(j '[.categories[].bookmarked, .channels[].bookmarked]' "$out")"
+  [[ $(j '.categories[0].bookmarked' "$out") == 1 && $(j '.categories[1].bookmarked' "$out") == 1 && $(j '.channels[0].bookmarked_streams' "$out") == 1 ]] && tok || tfail "bookmark counts per category and creator: $(j '[.categories[].bookmarked, .channels[].bookmarked]' "$out")"
   "$B" bookmark toggle LOFI1111111 >/dev/null; (( $(jq length "$XDG_CONFIG_HOME/omarchy-zen/bookmarks.json") == 2 )) && tok || tfail "toggle removes"
   "$B" bookmark remove vFJuk4U-V7Q >/dev/null; (( $(jq length "$XDG_CONFIG_HOME/omarchy-zen/bookmarks.json") == 1 )) && tok || tfail "remove"
   ! "$B" bookmark add 'https://evil.example/x' >/dev/null 2>&1 && tok || tfail "bookmark rejects non-video"
@@ -206,15 +206,45 @@ if want library; then
   out=$(DZ_CATALOG_FIXTURE="$T/cat-noapi.json" "$B" library --json); [[ $(j .ratings_api_available "$out") == false && $(j '.entries[0].count' "$out") == 0 ]] && tok || tfail "no ratings_api: not available, no fetch"
   # creators
   reset
-  out=$("$B" channel list --json); [[ $(j '.[0].id' "$out") == AetherJourneyMusic ]] && tok || tfail "default creator"
-  "$B" channel add 'https://www.youtube.com/@LofiGirl' >/dev/null && [[ $(jq -r '.[0].name' "$XDG_CONFIG_HOME/omarchy-zen/channels.json") == "Stub Creator" && $(jq -r '.[0].id' "$XDG_CONFIG_HOME/omarchy-zen/channels.json") == LofiGirl ]] && tok || tfail "channel add"
+  C="$XDG_CONFIG_HOME/omarchy-zen/channels.json"
+  out=$("$B" channel list --json); [[ $(j '.[0].id' "$out") == AetherJourneyMusic && $(j '.[0].builtin' "$out") == true && $(j '.[0].bookmarked' "$out") == false ]] && tok || tfail "built-in creator, not bookmarked: $out"
+  "$B" channel add '@LofiGirl' >/dev/null && "$B" channel add 'https://www.youtube.com/channel/UCSJ4gkVC6NrvII8umztf0Ow/videos' >/dev/null \
+    && "$B" channel add 'https://www.youtube.com/watch?v=LOFIvid0001' >/dev/null || tfail "channel add by handle, channel URL and video"
+  [[ $(jq length "$C") == 1 && $(jq -r '.[0].id' "$C") == LofiGirl && $(jq -r '.[0].channel_id' "$C") == UCSJ4gkVC6NrvII8umztf0Ow \
+     && $(jq -r '.[0].followers' "$C") == 15800000 && $(jq -r '.[0].url' "$C") == https://www.youtube.com/@LofiGirl ]] && tok || tfail "one record for the same creator three ways: $(cat "$C")"
   ! "$B" channel add 'https://evil.example/@x' >/dev/null 2>&1 && tok || tfail "channel add rejects other hosts"
+  ! "$B" channel add 'x;id' >/dev/null 2>&1 && tok || tfail "channel add rejects odd characters"
+  ! "$B" channel add '@NobodyHere' >/dev/null 2>&1 && tok || tfail "an unknown creator is an error"
+  out=$("$B" channel toggle AetherJourneyMusic --json); [[ $(j .bookmarked "$out") == true && $(j .builtin "$out") == true ]] && tok || tfail "bookmark a built-in creator: $out"
+  out=$("$B" channel toggle AetherJourneyMusic --json); [[ $(j .bookmarked "$out") == false ]] && "$B" channel list | grep -q AetherJourneyMusic && tok || tfail "unbookmarked built-in stays listed: $out"
+  "$B" resolve >/dev/null; : >"$DZ_LOG"
+  out=$("$B" channel add --json); [[ $(j .id "$out") == AetherJourneyMusic && $(j .bookmarked "$out") == true && -z $(grep yt-dlp "$DZ_LOG") ]] && tok || tfail "bookmark the creator of what is playing, from what is known: $out / $(cat "$DZ_LOG")"
+  out=$("$B" channel list --json); [[ $(j '[.[] | select(.bookmarked)] | length' "$out") == 2 && $(j '.[0].id' "$out") == LofiGirl ]] && tok || tfail "bookmarked creators first: $(j 'map(.id)' "$out")"
+  "$B" channel remove AetherJourneyMusic >/dev/null
+  # a creator's catalog
   : >"$DZ_LOG"; out=$("$B" channel videos AetherJourneyMusic --json)
-  [[ $(j 'length' "$out") == 2 && $(j '.[0].id' "$out") == LIVEaaaaaaa && $(j '.[0].live' "$out") == true && $(j '.[1].id' "$out") == VIDbbbbbbbb ]] && tok || tfail "creator videos: streams then uploads, no upcoming: $out"
-  grep -q -- '-- https://www.youtube.com/@AetherJourneyMusic/streams' "$DZ_LOG" && tok || tfail "streams tab argv"
-  : >"$DZ_LOG"; "$B" channel videos AetherJourneyMusic --json >/dev/null; [[ -z $(grep yt-dlp "$DZ_LOG") ]] && tok || tfail "creator videos cached"
-  out=$("$B" library --json --channel AetherJourneyMusic); [[ $(j .kind "$out") == channel && $(j '.entries|length' "$out") == 2 ]] && tok || tfail "library --channel"
-  "$B" channel remove LofiGirl >/dev/null; (( $(jq length "$XDG_CONFIG_HOME/omarchy-zen/channels.json") == 0 )) && tok || tfail "channel remove"
+  [[ $(j .kind "$out") == channel && $(jq -c .creator.counts <<<"$out") == '{"all":4,"live":1,"stream":1,"upload":2}' ]] && tok || tfail "tabs counted, short and upcoming left out: $(jq -c .creator.counts <<<"$out")"
+  [[ $(jq -c '[.entries[].id]' <<<"$out") == '["LIVEaaaaaaa","VIDbbbbbbbb","VIDlong0001","PASTstream1"]' ]] && tok || tfail "newest: live, uploads, past streams: $(jq -c '[.entries[].id]' <<<"$out")"
+  [[ $(j '.entries[1].kind' "$out") == upload && $(j '.entries[3].kind' "$out") == stream && $(j '.entries[0].creator.id' "$out") == AetherJourneyMusic ]] && tok || tfail "kinds and creator on rows"
+  grep -q -- '--playlist-items 1-300 -j -- https://www.youtube.com/@AetherJourneyMusic/streams' "$DZ_LOG" && grep -q -- '--playlist-items 1-300 -j -- https://www.youtube.com/@AetherJourneyMusic/videos' "$DZ_LOG" && tok || tfail "both tabs, 300 each: $(grep yt-dlp "$DZ_LOG")"
+  : >"$DZ_LOG"; "$B" channel videos AetherJourneyMusic --json >/dev/null; [[ -z $(grep yt-dlp "$DZ_LOG") ]] && tok || tfail "catalog cached"
+  out=$("$B" channel videos AetherJourneyMusic --json --kind upload); [[ $(j .creator.total "$out") == 2 && $(j '.entries|length' "$out") == 2 ]] && tok || tfail "--kind upload"
+  out=$("$B" channel videos AetherJourneyMusic --json --sort longest); [[ $(j '.entries[0].id' "$out") == VIDlong0001 ]] && tok || tfail "--sort longest"
+  out=$("$B" channel videos AetherJourneyMusic --json --sort popular); [[ $(j '.entries[0].id' "$out") == LIVEaaaaaaa && $(j '.entries[1].id' "$out") == VIDbbbbbbbb ]] && tok || tfail "--sort popular"
+  out=$("$B" channel videos AetherJourneyMusic --json --filter BEAR); [[ $(j .creator.total "$out") == 1 && $(j .creator.counts.all "$out") == 1 && $(j '.entries[0].id' "$out") == VIDlong0001 ]] && tok || tfail "--filter, case-insensitive"
+  out=$("$B" channel videos AetherJourneyMusic --json --offset 1 --limit 2); [[ $(j '.entries|length' "$out") == 2 && $(j .creator.total "$out") == 4 && $(j '.entries[0].id' "$out") == VIDbbbbbbbb ]] && tok || tfail "--offset/--limit page"
+  ! "$B" channel videos AetherJourneyMusic --kind shorts >/dev/null 2>&1 && ! "$B" channel videos AetherJourneyMusic --sort random >/dev/null 2>&1 && tok || tfail "bad --kind/--sort refused"
+  out=$("$B" library --json --channel UCSJ4gkVC6NrvII8umztf0Ow); [[ $(j .creator.id "$out") == LofiGirl && $(j .creator.bookmarked "$out") == true && $(j '.entries[0].id' "$out") == LOFI1111111 ]] && tok || tfail "browse by channel id: $(jq -c .creator <<<"$out")"
+  out=$("$B" library --json --category lofi); [[ $(j '.entries[0].creator.id' "$out") == LofiGirl && $(j '.entries[0].creator.bookmarked' "$out") == true ]] && tok || tfail "catalog rows know their saved creator: $(jq -c '.entries[0].creator' <<<"$out")"
+  out=$("$B" library --json --bookmarks); [[ $(jq -c '[.saved_creators[].id]' <<<"$out") == '["LofiGirl"]' ]] && tok || tfail "Bookmarks lists saved creators: $(jq -c '.saved_creators' <<<"$out")"
+  : >"$DZ_LOG"; "$B" channel open LofiGirl; for _ in 1 2 3 4 5 6 7 8 9 10; do grep -q 'xdg-open' "$DZ_LOG" && break; sleep 0.2; done
+  grep -q 'xdg-open https://www.youtube.com/@LofiGirl' "$DZ_LOG" && tok || tfail "channel open: $(cat "$DZ_LOG")"
+  # a catalog far larger than one command-line argument (128 KiB) goes through files
+  out=$(DZ_BIG_CATALOG=400 "$B" library --json --channel LofiGirl --refresh --limit 500) || tfail "big catalog: library exited $?"
+  [[ $(j '.entries|length' "$out") -ge 400 && ${#out} -gt 131072 ]] && tok || tfail "big catalog: $(j '.entries|length' "$out") entries, ${#out} bytes"
+  [[ $(find "$XDG_CACHE_HOME/omarchy-zen" -maxdepth 1 -name '.lib.*' | wc -l) == 0 ]] && tok || tfail "no scratch folders left behind"
+  "$B" channel remove LofiGirl >/dev/null; [[ $(jq length "$C") == 0 && ! -f $XDG_CACHE_HOME/omarchy-zen/channels/UCSJ4gkVC6NrvII8umztf0Ow.v2.json ]] && tok || tfail "remove drops the record and its cache"
+  out=$("$B" library --json --channel '@LofiGirl'); [[ $(j .creator.bookmarked "$out") == false && $(j '.entries|length' "$out") -ge 1 ]] && tok || tfail "browse a creator without bookmarking it"
   # play
   reset; : >"$DZ_LOG"
   "$B" play LOFI1111111 >/dev/null 2>&1 && [[ $(jq -r .url "$XDG_CONFIG_HOME/omarchy-zen/config.json") == https://www.youtube.com/watch?v=LOFI1111111 ]] && tok || tfail "play a catalog entry"

@@ -45,7 +45,7 @@ for cat in "${ORDER[@]}"; do
 done
 
 python3 - "$TMP" "$OUT" "${ORDER[@]}" <<'PY'
-import json, sys, os, datetime
+import json, sys, os, datetime, re
 tmp, out, *order = sys.argv[1:]
 names = {"lofi":"Lofi","work":"Work","study":"Study","focus":"Focus","zen":"Zen","ambient":"Ambient & nature",
          "jazz":"Jazz","sleep":"Sleep","classical":"Classical","synthwave":"Synthwave","streams":"24/7 streams"}
@@ -58,6 +58,7 @@ def entry(e):
     live = e.get("live_status") == "is_live"
     return {"id": e["id"], "title": (e.get("title") or "").strip(), "channel": e.get("channel") or e.get("uploader") or "",
             "channel_url": e.get("channel_url") or e.get("uploader_url") or "",
+            "channel_id": e.get("channel_id") or (re.search(r"(UC[A-Za-z0-9_-]{22})", e.get("channel_url") or "") or [None, ""])[1],
             "url": "https://www.youtube.com/watch?v=" + e["id"], "live": live,
             "duration": int(e.get("duration") or 0), "views": int(e.get("view_count") or 0),
             "viewers": int(e.get("concurrent_view_count") or 0)}

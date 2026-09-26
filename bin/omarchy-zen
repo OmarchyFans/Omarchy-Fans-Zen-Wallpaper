@@ -23,7 +23,8 @@
 #   omarchy-zen daily [--force]          the daily refresh (still, newest video, theme if enabled)
 #   omarchy-zen open                     open the current video in the browser
 #   omarchy-zen suno                     open the author's Suno invite (make your own music) in the browser
-#   omarchy-zen library [--json] [--category ID | --channel ID | --bookmarks] [--refresh]
+#   omarchy-zen library [--json] [--category ID | --channel REF | --bookmarks] [--refresh]
+#                          [--kind K --sort S --filter TEXT --offset N --limit N]   (creator filters, with --channel)
 #                                              the catalog (top 10 per category), a creator's latest, or your bookmarks,
 #                                              with your stars, everyone's average and what is playing
 #   omarchy-zen play ID|URL              play a library entry (a video id, a video URL or a creator's channel)
@@ -31,7 +32,12 @@
 #   omarchy-zen rate ID|URL 1..5         rate a video (0 removes); shared with every install unless share_ratings is off
 #   omarchy-zen share-ratings on|off     share your stars and plays (one per video and day) with every install
 #   omarchy-zen ratings [--refresh]      everyone's averages (cached an hour)
-#   omarchy-zen channel [list|add URL|remove ID|videos ID [--refresh]]   creators to follow
+#   omarchy-zen channel list [--json]          saved (bookmarked) creators plus the built-in ones
+#   omarchy-zen channel add|toggle|remove [REF] [--json]   bookmark a creator: a channel URL, @handle, channel id,
+#                                              or any of their video links; no REF = the creator of what is playing
+#   omarchy-zen channel videos REF [--kind all|live|stream|upload] [--sort newest|popular|longest]
+#                              [--filter TEXT] [--offset N] [--limit N] [--refresh] [--json]   browse a creator's catalog
+#   omarchy-zen channel open [REF]             the creator's page in the browser
 #   omarchy-zen catalog [--refresh]      the curated list (fetched from the main branch once a day)
 #   omarchy-zen update-check|update-dismiss|update-run   see docs/update-alerts.md
 #
@@ -189,6 +195,7 @@ FORMAT_JQ='
   | (pickv($h; $q) // pickv($p; $q)) as $v
   | (if (($v.protocol // "") | startswith("m3u8")) then (picka($h) // picka($p)) else (picka($p) // picka($h)) end) as $a
   | { source_url: $src, source_kind: $kind, video_id: .id, title: (.title // ""), channel: (.channel // .uploader // ""),
+      channel_id: (.channel_id // ""), channel_handle: (.uploader_id // ""), channel_url: (.uploader_url // .channel_url // ""),
       webpage_url: (.webpage_url // ""), duration: (.duration // 0), is_live: (.is_live // false), quality: $q,
       video_url: ($v.url // ""), video_height: ($v.height // 0), video_format: ($v.format_id // ""), video_protocol: ($v.protocol // ""),
       audio_url: ($a.url // ""), audio_format: ($a.format_id // ""), resolved_at: $now, expires: 0 }
@@ -494,23 +501,136 @@ channel_id_of() { # channel_id_of URL|ID -> handle (without @) or channel id
 bookmarks_json() { json_file_or "$BOOKMARKS" 'type == "array"' '[]'; }
 my_ratings_json() { json_file_or "$MY_RATINGS" 'type == "object"' '{}'; }
 my_channels_json() { json_file_or "$MY_CHANNELS" 'type == "array"' '[]'; }
-channels_json() { jq -s '(.[0] + .[1]) | unique_by(.id)' <(jq '.channels // []' "$(catalog_file)") <(my_channels_json); }
+# Every creator the selector shows: the ones you bookmarked (channels.json,
+# oldest first) and the built-in ones from the catalog. One record per creator
+# even when it arrived once as @handle and once as a channel id.
+CHANNELS_JQ='
+  def ckey: ((.channel_id // "") | if . == "" then null else . end);
+  def same($a; $b): ($a | ckey) as $x | ($b | ckey) as $y
+    | (($x != null and $x == $y) or ((($a.id // "") | ascii_downcase) == (($b.id // "") | ascii_downcase)));
+  (.[0] | map(. + {builtin: true, bookmarked: false})) as $cat
+  | (.[1] | map(. + {bookmarked: true, builtin: false})) as $mine
+  | reduce ($mine + $cat)[] as $c ([];
+      (map(same(.; $c)) | index(true)) as $i
+      | if $i == null then . + [$c]
+        else .[$i] |= (. + {builtin: (.builtin or $c.builtin),
+                              channel_id: ((.channel_id // "") | if . == "" then ($c.channel_id // "") else . end),
+                              followers: ((.followers // 0) | if . == 0 then ($c.followers // 0) else . end),
+                              note: (.note // $c.note // "")}) end)
+  | map(. + {handle: ((.handle // "") | if . != "" then . else "" end), followers: (.followers // 0), channel_id: (.channel_id // "")})
+  | map(if .handle == "" and ((.url // "") | test("/@[A-Za-z0-9._-]+$")) then .handle = ("@" + (.url | capture("/@(?<h>[A-Za-z0-9._-]+)$").h)) else . end)'
+channels_json() { jq -s "$CHANNELS_JQ" <(jq '.channels // []' "$(catalog_file)") <(my_channels_json); }
+# The record for a creator reference (id, @handle, channel id, or a URL of
+# theirs), among the saved and built-in ones.
+find_channel() {
+  local ref=$1 cid="" hid=""
+  LC_ALL=C
+  [[ $ref =~ (UC[A-Za-z0-9_-]{22}) ]] && cid=${BASH_REMATCH[1]}
+  [[ $ref =~ (^|/)@([A-Za-z0-9._-]+) ]] && hid=${BASH_REMATCH[2]}
+  [[ -z $hid && -z $cid ]] && hid=$(channel_id_of "$ref" 2>/dev/null || true)
+  channels_json | jq -ce --arg cid "$cid" --arg h "$hid" --arg ref "${ref%/}" '
+    first(.[] | select(($cid != "" and .channel_id == $cid)
+      or ($h != "" and (((.id // "") | ascii_downcase) == ($h | ascii_downcase) or ((.handle // "") | ascii_downcase) == ("@" + ($h | ascii_downcase))))
+      or ((.url // "") == $ref)))' 2>/dev/null
+}
+CHANNEL_MAX=${OMARCHY_ZEN_CHANNEL_MAX:-300}
+CATALOG_TIMEOUT_SEC=${OMARCHY_ZEN_CATALOG_TIMEOUT:-60}
+CATALOG_MAX_BYTES=${OMARCHY_ZEN_CATALOG_MAX_BYTES:-8000000}
+# Ask YouTube who a reference belongs to: a channel URL, @handle or channel id
+# (one small playlist request), or a video (its uploader). Prints a record
+# {id, name, url, channel_id, handle, followers}. Bounded like every yt-dlp call.
+channel_resolve() {
+  local ref=$1 vid url="" meta cid="" handle="" name="" followers=0 id
+  LC_ALL=C
+  if vid=$(video_id_of "$ref"); then
+    meta=$(timeout -k 5 "$YTDLP_TIMEOUT_SEC" yt-dlp --no-warnings --skip-download --no-playlist \
+             --print '%(channel_id)s	%(uploader_id)s	%(channel)s	%(channel_follower_count)s' -- "https://www.youtube.com/watch?v=$vid" 2>/dev/null \
+           | head -c 4096 | head -n1 || true)
+  else
+    if [[ $ref =~ ^@[A-Za-z0-9._-]+$ ]]; then url="https://www.youtube.com/$ref"
+    elif [[ $ref =~ ^UC[A-Za-z0-9_-]{22}$ ]]; then url="https://www.youtube.com/channel/$ref"
+    elif [[ $ref =~ ^[A-Za-z0-9._-]{3,100}$ ]]; then url="https://www.youtube.com/@$ref"
+    elif valid_url "$ref"; then url=$(sed -E 's#/+$##; s#/(videos|streams|live|featured|shorts|playlists|community|about)$##' <<<"$ref")
+    else return 1; fi
+    meta=$(timeout -k 5 "$YTDLP_TIMEOUT_SEC" yt-dlp --no-warnings --flat-playlist --playlist-items 1 -J -- "$url/videos" 2>/dev/null \
+           | head -c "$YTDLP_MAX_BYTES" \
+           | jq -r '[(.channel_id // .playlist_channel_id // ""), (.uploader_id // ""), (.channel // .uploader // ""), ((.channel_follower_count // 0) | tostring)] | @tsv' 2>/dev/null || true)
+  fi
+  IFS=$'\t' read -r cid handle name followers <<<"$meta"
+  [[ $cid =~ ^UC[A-Za-z0-9_-]{22}$ ]] || return 1
+  [[ $handle =~ ^@[A-Za-z0-9._-]+$ ]] || handle=""
+  [[ $followers =~ ^[0-9]+$ ]] || followers=0
+  if [[ -n $handle ]]; then id=${handle#@}; url="https://www.youtube.com/$handle"; else id=$cid; url="https://www.youtube.com/channel/$cid"; fi
+  jq -nc --arg id "$id" --arg n "${name:-$id}" --arg u "$url" --arg c "$cid" --arg h "$handle" --argjson f "$followers" \
+    '{id: $id, name: $n, url: $u, channel_id: $c, handle: $h, followers: $f}'
+}
+channel_key() { jq -r '(.channel_id // "") as $c | if $c != "" then $c else .id end' <<<"$1"; }
+# A creator's catalog: live now, past streams and uploads (up to CHANNEL_MAX
+# per tab, newest first as YouTube lists them, shorts under a minute left
+# out), cached CHANNEL_TTL. Prints the cache file's path; the file is an
+# array with one entry per video, tagged kind live|stream|upload.
+channel_catalog() { # channel_catalog RECORD_JSON [refresh]
+  local rec=$1 refresh=${2:-0} url key f tmp raw
+  url=$(jq -r .url <<<"$rec"); key=$(channel_key "$rec")
+  valid_url "$url" || die "no usable URL for this creator"
+  [[ $key =~ ^[A-Za-z0-9._-]+$ ]] || die "bad creator id"
+  mkdir -p "$CHANNEL_CACHE"
+  f="$CHANNEL_CACHE/$key.v2.json"
+  if (( refresh )) || ! fresh "$f" "$CHANNEL_TTL"; then
+    tmp=$(mktemp "$CHANNEL_CACHE/.$key.XXXXXX"); raw=$(mktemp "$CHANNEL_CACHE/.$key.raw.XXXXXX")
+    { timeout -k 5 "$CATALOG_TIMEOUT_SEC" yt-dlp --no-warnings --flat-playlist --playlist-items "1-$CHANNEL_MAX" -j -- "$url/streams" 2>/dev/null \
+        | jq -c '. + {__tab: "streams"}' 2>/dev/null || true
+      timeout -k 5 "$CATALOG_TIMEOUT_SEC" yt-dlp --no-warnings --flat-playlist --playlist-items "1-$CHANNEL_MAX" -j -- "$url/videos" 2>/dev/null \
+        | jq -c '. + {__tab: "videos"}' 2>/dev/null || true; } | head -c "$CATALOG_MAX_BYTES" >"$raw"
+    jq -sc --arg curl "$url" --arg cname "$(jq -r .name <<<"$rec")" --arg cid "$(jq -r '.channel_id // ""' <<<"$rec")" '
+      [ .[] | select(.id != null and (.live_status // "") != "is_upcoming")
+        | (if .live_status == "is_live" then "live" elif .__tab == "streams" or .live_status == "was_live" then "stream" else "upload" end) as $k
+        | select($k == "live" or (.duration // 0) == 0 or (.duration // 0) >= 60)
+        | {id, title: (.title // ""), channel: (.playlist_channel // .channel // .uploader // $cname), channel_url: $curl,
+           channel_id: (.playlist_channel_id // .channel_id // $cid), url: ("https://www.youtube.com/watch?v=" + .id),
+           live: ($k == "live"), kind: $k, duration: ((.duration // 0) | floor), views: (.view_count // 0),
+           viewers: (.concurrent_view_count // 0), order: (.playlist_index // 0)} ]
+      | reduce .[] as $e ([]; if any(.[]; .id == $e.id) then . else . + [$e] end)' "$raw" >"$tmp" 2>/dev/null || true
+    rm -f -- "${raw:?}"
+    if jq -e 'type == "array" and length > 0' "$tmp" >/dev/null 2>&1; then mv -f "$tmp" "$f"; else rm -f -- "${tmp:?}"; [[ -f $f ]] && touch "$f"; fi
+  fi
+  [[ -f $f ]] || echo '[]' >"$f"
+  echo "$f"
+}
+# Filter, sort and page a catalog file. Counts are after the text filter and
+# before the kind filter, so each tab shows what it holds.
+CATALOG_QUERY_JQ='
+  (($filter | ascii_downcase) as $q | map(select($q == "" or ((.title // "") | ascii_downcase | contains($q))))) as $hits
+  | {counts: {all: ($hits | length), live: ([$hits[] | select(.kind == "live")] | length),
+              stream: ([$hits[] | select(.kind == "stream")] | length), upload: ([$hits[] | select(.kind == "upload")] | length)},
+     rows: ([$hits[] | select($kind == "all" or .kind == $kind)]
+            | if $sort == "popular" then sort_by(-(if .live then .viewers * 1000 else .views end))
+              elif $sort == "longest" then sort_by(-(.duration // 0))
+              else sort_by((if .kind == "live" then 0 elif .kind == "upload" then 1 else 2 end), .order) end)}
+  | .total = (.rows | length) | .entries = .rows[$offset:($offset + $limit)] | del(.rows)'
 # One entry from the catalog, a creator cache or the bookmarks, by video id.
 find_entry() {
   local id=$1
   jq -c --arg id "$id" 'first((.categories[].entries[]? // empty), empty | select(.id == $id))' "$(catalog_file)" 2>/dev/null | grep -v '^null$' && return 0
   bookmarks_json | jq -c --arg id "$id" 'first(.[] | select(.id == $id))' | grep -v '^null$' && return 0
-  cat "$CHANNEL_CACHE"/*.json 2>/dev/null | jq -c --arg id "$id" 'first(.[] | select(.id == $id))' 2>/dev/null | grep -v '^null$' | head -n1 && return 0
+  cat "$CHANNEL_CACHE"/*.json 2>/dev/null | jq -c --arg id "$id" 'first(.[]? | select(.id == $id))' 2>/dev/null | grep -v '^null$' | head -n1 && return 0
   return 1
 }
 now_entry() {
   [[ -f $STREAM ]] || { echo null; return 0; }
-  jq -c '{id: .video_id, title, channel, url: .webpage_url, live: .is_live, channel_url: ""}' "$STREAM"
+  jq -c '{id: .video_id, title, channel, url: .webpage_url, live: .is_live, channel_url: (.channel_url // ""), channel_id: (.channel_id // "")}' "$STREAM"
 }
-ANNOTATE_JQ='def annotate($m; $c; $b; $now): (.id // "") as $vid | . + {
-  bookmarked: (($b | index([$vid])) != null), my_stars: ($m[$vid].stars // 0),
-  avg: ($c[$vid].avg // 0), count: ($c[$vid].count // 0), plays: ($c[$vid].plays // 0),
-  views: (.views // 0), viewers: (.viewers // 0), playing: ($vid == $now) };'
+ANNOTATE_JQ='
+  def chan_of($chans): (.channel_url // "") as $u | (.channel_id // "") as $cid
+    | ([$chans[] | (.channel_id // "") as $chid | ((.handle // "") | ascii_downcase) as $h | (.url // "") as $curl
+        | select(($chid != "" and ($cid == $chid or ($u | contains($chid))))
+          or ($u != "" and ($u == $curl or ($h != "" and ($u | ascii_downcase | endswith("/" + $h))))))] | first) // null;
+  def annotate($m; $c; $b; $now; $chans): (.id // "") as $vid | chan_of($chans) as $ch | . + {
+    bookmarked: (($b | index([$vid])) != null), my_stars: ($m[$vid].stars // 0),
+    avg: ($c[$vid].avg // 0), count: ($c[$vid].count // 0), plays: ($c[$vid].plays // 0),
+    views: (.views // 0), viewers: (.viewers // 0), playing: ($vid == $now),
+    creator: (if $ch then {id: $ch.id, name: $ch.name, bookmarked: $ch.bookmarked, builtin: $ch.builtin} else null end),
+    creator_ref: (if $ch then $ch.id elif (.channel_id // "") != "" then .channel_id elif (.channel_url // "") != "" then .channel_url else .id end) };'
 
 cmd_catalog() {
   local refresh=0 json=0 a f
@@ -538,11 +658,13 @@ cmd_bookmark() {
       fi
       if [[ -z $ref ]]; then
         title=$(jq -r .title "$STREAM"); channel=$(jq -r .channel "$STREAM"); url=$(jq -r .webpage_url "$STREAM")
-        extra=$(jq -c '{live: (.is_live // false)}' "$STREAM")
-        if entry=$(find_entry "$id"); then extra=$(jq -c '{views: (.views // 0), viewers: (.viewers // 0), live: (.live // false), channel_url: (.channel_url // "")}' <<<"$entry"); fi
+        extra=$(jq -c '{live: (.is_live // false), channel_url: (.channel_url // ""), channel_id: (.channel_id // "")}' "$STREAM")
+        if entry=$(find_entry "$id"); then extra=$(jq -c --slurpfile s "$STREAM" '{views: (.views // 0), viewers: (.viewers // 0), live: (.live // false),
+          channel_url: (if (.channel_url // "") != "" then .channel_url else ($s[0].channel_url // "") end),
+          channel_id: (if (.channel_id // "") != "" then .channel_id else ($s[0].channel_id // "") end)}' <<<"$entry"); fi
       elif entry=$(find_entry "$id"); then
         title=$(jq -r .title <<<"$entry"); channel=$(jq -r .channel <<<"$entry"); url=$(jq -r .url <<<"$entry")
-        extra=$(jq -c '{views: (.views // 0), viewers: (.viewers // 0), live: (.live // false), channel_url: (.channel_url // "")}' <<<"$entry")
+        extra=$(jq -c '{views: (.views // 0), viewers: (.viewers // 0), live: (.live // false), channel_url: (.channel_url // ""), channel_id: (.channel_id // "")}' <<<"$entry")
       else
         url="https://www.youtube.com/watch?v=$id"
         IFS=$'\t' read -r title channel < <(timeout -k 5 "$YTDLP_TIMEOUT_SEC" yt-dlp --no-warnings --skip-download --no-playlist --print '%(title)s\t%(channel)s' -- "$url" 2>/dev/null | head -c "$YTDLP_MAX_BYTES" | head -n1 || true)
@@ -612,47 +734,71 @@ cmd_ratings() {
   else community_ratings "$refresh" | jq -r 'to_entries | sort_by(-.value.avg) | .[] | "\(.key)  \(.value.avg) (\(.value.count))"'; fi
 }
 
-channel_videos() { # channel_videos ID [refresh] -> JSON array of entries (streams tab first, then uploads)
-  local id=$1 refresh=${2:-0} url f tmp
-  url=$(channels_json | jq -r --arg id "$id" 'first(.[] | select(.id == $id)) | .url // ""')
-  [[ -n $url ]] || die "unknown creator: $id (channel add URL first)"
-  f="$CHANNEL_CACHE/$id.json"
-  if (( refresh )) || ! fresh "$f" "$CHANNEL_TTL"; then
-    mkdir -p "$CHANNEL_CACHE"; tmp=$(mktemp "$CHANNEL_CACHE/.$id.XXXXXX")
-    { timeout -k 5 "$YTDLP_TIMEOUT_SEC" yt-dlp --no-warnings --flat-playlist --playlist-items 1-10 -j -- "${url%/}/streams" 2>/dev/null || true
-      timeout -k 5 "$YTDLP_TIMEOUT_SEC" yt-dlp --no-warnings --flat-playlist --playlist-items 1-10 -j -- "${url%/}/videos" 2>/dev/null || true; } \
-      | head -c "$YTDLP_MAX_BYTES" \
-      | jq -sc --arg curl "$url" '[.[] | select(.id != null and .live_status != "is_upcoming")] | unique_by(.id) | .[0:20]
-          | map({id, title: (.title // ""), channel: (.channel // .uploader // ""), channel_url: (.channel_url // .uploader_url // $curl),
-                 url: ("https://www.youtube.com/watch?v=" + .id), live: (.live_status == "is_live"),
-                 duration: ((.duration // 0) | floor), views: (.view_count // 0), viewers: (.concurrent_view_count // 0)})' >"$tmp" 2>/dev/null
-    if jq -e 'type == "array" and length > 0' "$tmp" >/dev/null 2>&1; then mv -f "$tmp" "$f"; else rm -f "$tmp"; [[ -f $f ]] && touch "$f"; fi
+# The creator to act on: REF as given, or the creator of what is playing.
+channel_ref_default() {
+  local r=${1:-}
+  if [[ -z $r ]]; then
+    [[ -f $STREAM ]] || die "nothing is playing; give a channel URL, @handle or video link"
+    r=$(jq -r 'if (.channel_handle // "") != "" then .channel_handle elif (.channel_id // "") != "" then .channel_id else (.channel_url // "") end' "$STREAM")
+    [[ -n $r ]] || r=$(jq -r .video_id "$STREAM")
   fi
-  json_file_or "$f" 'type == "array"' '[]'
+  echo "$r"
+}
+channel_save() { # channel_save REF -> prints the saved record
+  local ref=$1 rec known
+  if known=$(find_channel "$ref") && [[ $(jq -r '.channel_id // ""' <<<"$known") =~ ^UC ]]; then
+    rec=$(jq -c '{id, name, url, channel_id, handle, followers}' <<<"$known")
+  elif [[ -n ${known:-} ]]; then
+    rec=$(channel_resolve "$(jq -r .url <<<"$known")") || die "could not reach YouTube to look up $ref"
+  else
+    rec=$(channel_resolve "$ref") || die "could not find that creator on YouTube: $ref"
+  fi
+  mkdir -p "$CONFIG_DIR"
+  my_channels_json | jq --argjson r "$rec" --argjson at "$(now)" '
+    [.[] | select((.channel_id // "") != $r.channel_id and ((.id // "") | ascii_downcase) != ($r.id | ascii_downcase))] + [$r + {added: $at}]' \
+    | write_json "$MY_CHANNELS"
+  find_channel "$(jq -r .channel_id <<<"$rec")"
+}
+channel_unsave() { # channel_unsave RECORD_JSON
+  local rec=$1 key
+  my_channels_json | jq --argjson r "$rec" '[.[] | select(((.channel_id // "") == "" or .channel_id != ($r.channel_id // ""))
+      and ((.id // "") | ascii_downcase) != (($r.id // "") | ascii_downcase))]' | write_json "$MY_CHANNELS"
+  key=$(channel_key "$rec")
+  if [[ $(jq -r '.builtin // false' <<<"$rec") != true && $key =~ ^[A-Za-z0-9._-]+$ ]]; then rm -f -- "${CHANNEL_CACHE:?}/$key.v2.json"; fi
+  return 0
 }
 cmd_channel() {
-  local sub=${1:-list} id url name
+  local sub=${1:-list} ref="" rec json=0 a
   shift || true
   case "$sub" in
-    list) if [[ ${1:-} == --json ]]; then channels_json; else channels_json | jq -r '.[] | "\(.id)  \(.name)  \(.url)"'; fi ;;
-    add)
-      url=${1:-}; valid_url "$url" || die "only https YouTube channel links are accepted"
-      id=$(channel_id_of "$url") || die "not a channel URL: $url"
-      name=$(timeout -k 5 "$YTDLP_TIMEOUT_SEC" yt-dlp --no-warnings --flat-playlist --playlist-items 1 --print channel -- "${url%/}/videos" 2>/dev/null | head -c "$YTDLP_MAX_BYTES" | head -n1 || true)
-      [[ -n $name ]] || name=$id
-      mkdir -p "$CONFIG_DIR"
-      my_channels_json | jq --arg id "$id" --arg n "$name" --arg u "${url%/}" --argjson at "$(now)" \
-        '[.[] | select(.id != $id)] + [{id: $id, name: $n, url: $u, added: $at}]' | write_json "$MY_CHANNELS"
-      echo "following $id ($name)" ;;
-    remove)
-      id=$(channel_id_of "${1:-}") || die "remove wants a creator id or URL"
-      my_channels_json | jq --arg id "$id" '[.[] | select(.id != $id)]' | write_json "$MY_CHANNELS"; rm -f "$CHANNEL_CACHE/$id.json"
-      echo "removed $id" ;;
+    list)
+      if [[ ${1:-} == --json ]]; then channels_json
+      else channels_json | jq -r '.[] | "\(if .bookmarked then "★" else " " end) \(.id)  \(.name)  \(.url)\(if .builtin then "  (built in)" else "" end)"'; fi ;;
+    add|bookmark|toggle|remove|unbookmark)
+      for a in "$@"; do case "$a" in --json) json=1 ;; *) ref=$a ;; esac; done
+      ref=$(channel_ref_default "$ref")
+      if [[ $sub == toggle ]]; then
+        if rec=$(find_channel "$ref") && [[ $(jq -r .bookmarked <<<"$rec") == true ]]; then sub=remove; else sub=add; fi
+      fi
+      if [[ $sub == add || $sub == bookmark ]]; then
+        rec=$(channel_save "$ref")
+        if (( json )); then echo "$rec"; else jq -r '"bookmarked \(.id) (\(.name))"' <<<"$rec"; fi
+      else
+        rec=$(find_channel "$ref") || die "not a saved creator: $ref"
+        channel_unsave "$rec"
+        rec=$(find_channel "$(jq -r .id <<<"$rec")" || jq -c '. + {bookmarked: false}' <<<"$rec")
+        if (( json )); then jq -c '. + {bookmarked: false}' <<<"$rec"
+        else jq -r '"removed the bookmark on \(.id)\(if .builtin then " (it stays in the selector: built in)" else "" end)"' <<<"$rec"; fi
+      fi ;;
     videos)
-      id=$(channel_id_of "${1:-}") || die "videos wants a creator id"; shift || true
-      local refresh=0 json=0 a; for a in "$@"; do case "$a" in --refresh) refresh=1 ;; --json) json=1 ;; esac; done
-      if (( json )); then channel_videos "$id" "$refresh"; else channel_videos "$id" "$refresh" | jq -r '.[] | "\(.id)  \(.title)\(if .live then "  [live]" else "" end)"'; fi ;;
-    *) die "channel: list, add, remove or videos" ;;
+      ref=${1:-}; shift || true
+      [[ -n $ref ]] || die "videos wants a creator"
+      cmd_library --channel "$ref" "$@" ;;
+    open)
+      ref=$(channel_ref_default "${1:-}")
+      rec=$(find_channel "$ref") || rec=$(channel_resolve "$ref") || die "unknown creator: $ref"
+      setsid -f xdg-open "$(jq -r .url <<<"$rec")" >/dev/null 2>&1 </dev/null ;;
+    *) die "channel: list, add, toggle, remove, videos or open" ;;
   esac
 }
 
@@ -665,9 +811,8 @@ cmd_play() {
   elif valid_url "$ref"; then
     url=$ref
   else
-    id=$(channel_id_of "$ref") || die "not a video or creator: $ref"
-    url=$(channels_json | jq -r --arg id "$id" 'first(.[] | select(.id == $id)) | .url // ""')
-    [[ -n $url ]] || die "unknown creator: $ref"
+    url=$(find_channel "$ref" | jq -r '.url // ""')
+    [[ -n $url ]] || die "unknown creator: $ref (bookmark it first: channel add URL)"
   fi
   if ( cmd_set_url "$url" >/dev/null 2>&1 ); then cmd_resolve; return 0; fi
   # A live radio restarted under a new id: its channel's newest stream is the same thing.
@@ -678,45 +823,83 @@ cmd_play() {
 }
 
 cmd_library() {
-  local json=0 refresh=0 category="" channel="" bookmarks=0 a f now community mine bm chans entries kind
+  local json=0 refresh=0 category="" channel="" bookmarks=0 f now kind rec="null" catf=""
+  local ckind=all csort=newest cfilter="" coffset=0 climit=30
   while (( $# )); do
     case "$1" in
       --json) json=1 ;; --refresh) refresh=1 ;; --bookmarks) bookmarks=1 ;;
-      --category) category=${2:-}; shift ;; --channel) channel=$(channel_id_of "${2:-}") || die "bad creator"; shift ;;
+      --category) category=${2:-}; shift ;; --channel) channel=${2:-}; shift ;;
+      --kind) ckind=${2:-}; shift ;; --sort) csort=${2:-}; shift ;; --filter) cfilter=${2:-}; shift ;;
+      --offset) coffset=${2:-}; shift ;; --limit) climit=${2:-}; shift ;;
       *) die "library: unknown option $1" ;;
     esac; shift
   done
-  f=$(catalog_file "$refresh"); community=$(community_ratings "$refresh"); mine=$(my_ratings_json); bm=$(bookmarks_json)
+  case "$ckind" in all|live|stream|upload) ;; *) die "--kind: all, live, stream or upload" ;; esac
+  case "$csort" in newest|popular|longest) ;; *) die "--sort: newest, popular or longest" ;; esac
+  [[ $coffset =~ ^[0-9]+$ && $climit =~ ^[0-9]+$ ]] || die "--offset and --limit want numbers"
+  (( climit <= 500 )) || climit=500
+  cfilter=${cfilter:0:100}
+  f=$(catalog_file "$refresh")
+  # Everything that can fail runs before the scratch folder exists.
+  if [[ -n $channel ]] && (( ! bookmarks )); then
+    rec=$(find_channel "$channel") || rec=$(channel_resolve "$channel" | jq -c '. + {bookmarked: false, builtin: false}') \
+      || die "unknown creator: $channel"
+    catf=$(channel_catalog "$rec" "$refresh")
+  fi
   # What is playing: the configured video right away (set-url writes it before
   # the resolve finishes), the resolved stream for channel and playlist URLs.
   now=$(video_id_of "$(cfg url)" 2>/dev/null) || now=$(jq -r '.video_id // ""' "$STREAM" 2>/dev/null || true)
-  chans=$(channels_json)
-  if (( bookmarks )); then entries=$bm; kind=bookmarks
-  elif [[ -n $channel ]]; then entries=$(channel_videos "$channel" "$refresh"); kind=channel
+  # Everything goes to jq through files: a creator's catalog is far larger
+  # than one command-line argument may be (128 KiB).
+  mkdir -p "$CACHE_DIR"
+  local d; d=$(mktemp -d "$CACHE_DIR/.lib.XXXXXX")
+  community_ratings "$refresh" >"$d/community"; my_ratings_json >"$d/mine"; bookmarks_json >"$d/bm"; channels_json >"$d/chans"; now_entry >"$d/nowe"
+  echo '{}' >"$d/query"
+  if (( bookmarks )); then cp "$d/bm" "$d/entries"; kind=bookmarks
+  elif [[ -n $catf ]]; then
+    jq --arg kind "$ckind" --arg sort "$csort" --arg filter "$cfilter" --argjson offset "$coffset" --argjson limit "$climit" \
+      "$CATALOG_QUERY_JQ" "$catf" >"$d/query" || echo '{"counts":{"all":0,"live":0,"stream":0,"upload":0},"total":0,"entries":[]}' >"$d/query"
+    jq '.entries' "$d/query" >"$d/entries"; kind=channel
   else
     [[ -n $category ]] || category=$(jq -r '.categories[0].id // ""' "$f")
-    entries=$(jq -c --arg c "$category" 'first(.categories[] | select(.id == $c)) | .entries // []' "$f"); kind=category
+    jq -c --arg c "$category" 'first(.categories[] | select(.id == $c)) | .entries // []' "$f" >"$d/entries"; kind=category
   fi
+  printf '%s' "$rec" >"$d/rec"
   local api_ok=false; ratings_api >/dev/null && api_ok=true
-  local out
-  out=$(jq -n --argjson entries "$entries" --argjson bm "$bm" --argjson mine "$mine" --argjson community "$community" --argjson chans "$chans" \
-    --argjson nowe "$(now_entry)" --arg now "$now" --arg kind "$kind" --arg category "$category" --arg channel "$channel" --argjson api "$api_ok" \
-    --argjson cats "$(jq -c --argjson bm "$bm" '($bm | map(.id)) as $bids | [.categories[] | {id, name, count: (.entries | length),
-        bookmarked: ([.entries[] | (.id // "") as $i | select(($bids | index([$i])) != null)] | length)}]' "$f")" --arg generated "$(jq -r '.generated // ""' "$f")" \
+  local out=""
+  out=$(jq -n --slurpfile entries "$d/entries" --slurpfile bm "$d/bm" --slurpfile mine "$d/mine" --slurpfile community "$d/community" \
+    --slurpfile chans "$d/chans" --slurpfile nowe "$d/nowe" --slurpfile query "$d/query" --slurpfile rec "$d/rec" --slurpfile cat "$f" \
+    --arg now "$now" --arg kind "$kind" --arg category "$category" --argjson api "$api_ok" \
+    --arg ckind "$ckind" --arg csort "$csort" --arg cfilter "$cfilter" --argjson coffset "$coffset" --argjson climit "$climit" \
     "$ANNOTATE_JQ"'
-    ($bm | map(.id)) as $bids
-    | { generated: $generated, ratings_api_available: $api, kind: $kind, category: $category, channel: $channel,
-        categories: $cats,
-        channels: ($chans | map(. as $ch | . + {bookmarked: ([$bm[] | select((.channel_url // "") != "" and ((.channel_url // "") == $ch.url or (.channel // "") == $ch.name))] | length)})),
-        now: (if $nowe then ($nowe | annotate($mine; $community; $bids; $now)) else null end),
-        bookmarks: ($bm | map(annotate($mine; $community; $bids; $now))),
-        entries: ($entries | map(annotate($mine; $community; $bids; $now))) }')
+    $bm[0] as $bm | $mine[0] as $mine | $community[0] as $community | $chans[0] as $chans | ($bm | map(.id)) as $bids
+    | def ann: annotate($mine; $community; $bids; $now; $chans);
+    { generated: ($cat[0].generated // ""), ratings_api_available: $api, kind: $kind, category: $category,
+      channel: (if $rec[0] then $rec[0].id else "" end),
+      categories: [$cat[0].categories[] | {id, name, count: (.entries | length),
+        bookmarked: ([.entries[] | (.id // "") as $i | select(($bids | index([$i])) != null)] | length)}],
+      channels: ($chans | map(. as $ch | . + {bookmarked_streams: ([$bm[] | select(
+          ((.channel_id // "") != "" and .channel_id == $ch.channel_id)
+          or ((.channel_url // "") != "" and ((.channel_url // "") == $ch.url or (($ch.channel_id // "") != "" and ((.channel_url // "") | contains($ch.channel_id)))))
+          or ((.channel_url // "") == "" and (.channel // "") == $ch.name))] | length)})),
+      creator: (if $rec[0] then ($rec[0] + ($query[0] | {counts, total}) + {kind: $ckind, sort: $csort, filter: $cfilter, offset: $coffset, limit: $climit}) else null end),
+      saved_creators: [$chans[] | select(.bookmarked)],
+      now: (if $nowe[0] then ($nowe[0] | ann) else null end),
+      bookmarks: ($bm | map(ann)),
+      entries: ($entries[0] | map(ann)) }') || out=""
+  rm -f -- "${d:?}/community" "${d:?}/mine" "${d:?}/bm" "${d:?}/chans" "${d:?}/nowe" "${d:?}/query" "${d:?}/entries" "${d:?}/rec"
+  rmdir -- "${d:?}" 2>/dev/null || true
+  [[ -n $out ]] || die "could not build the library"
   if (( json )); then echo "$out"; return 0; fi
-  jq -r '"\(.kind) \(.category)\(.channel) — \(.entries | length) entries\(if .ratings_api_available then "" else " (community ratings not available yet)" end)",
-         (.entries[] | "  \(if .playing then "▶" else " " end)\(if .bookmarked then "★" else " " end) \(.id)  \(.title | .[0:60])  — \(.channel)\(if .live then "  [live]" else "" end)  \(if .my_stars > 0 then "you: \(.my_stars)" else "" end)\(if .count > 0 then "  all: \(.avg) (\(.count))" else "" end)")' <<<"$out"
+  jq -r '
+    (if .kind == "channel" then "\(.creator.name) — \(.creator.total) of \(.creator.counts.all) (live \(.creator.counts.live), past streams \(.creator.counts.stream), uploads \(.creator.counts.upload))\(if .creator.bookmarked then ", bookmarked" else "" end)"
+     else "\(.kind) \(.category) — \(.entries | length) entries" end)
+      + (if .ratings_api_available then "" else " (community ratings not available yet)" end),
+    (.entries[] | "  \(if .playing then "▶" else " " end)\(if .bookmarked then "★" else " " end) \(.id)  \(.title | .[0:60])  — \(.channel)\(if .live then "  [live]" else "" end)  \(if .my_stars > 0 then "you: \(.my_stars)" else "" end)\(if .count > 0 then "  all: \(.avg) (\(.count))" else "" end)"),
+    (if .kind == "bookmarks" and (.saved_creators | length) > 0 then "creators:", (.saved_creators[] | "  ★ \(.id)  \(.name)") else empty end)' <<<"$out"
 }
 
-usage() { sed -n '3,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,41p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 main() {
   local cmd=${1:-help}; shift || true
